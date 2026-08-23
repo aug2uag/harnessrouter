@@ -1,11 +1,11 @@
-# HarnessRouter — self-hosted, all-in-one.
+# HarnessRouter — self-hosted, headless (this fork carries no UI).
 #
-# One container runs the whole product: the UI, the gateway, and the agent runner. There is
-# no cloud dependency, no control plane to reach, and nothing to provision. State is SQLite
-# and files on one mounted volume.
+# One container runs the whole product: the gateway and the agent runner, driven by its API
+# rather than a browser console. There is no cloud dependency, no control plane to reach, and
+# nothing to provision. State is SQLite and files on one mounted volume.
 #
 # Why one container rather than compose-by-default: self-hosting should be `docker run`. The
-# three processes are supervised by a tiny entrypoint, and because the gateway talks to the
+# two processes are supervised by a tiny entrypoint, and because the gateway talks to the
 # runner over loopback it needs no pool, no service discovery and no cloud identity.
 #
 # AGENT CLIs ARE INSTALLED ON FIRST RUN, NOT BAKED IN. This is a licensing requirement, not a
@@ -22,26 +22,6 @@
 #
 # WITH_BROWSER is still a build arg because Chromium and its system libraries genuinely belong
 # in the image layer.
-
-# ── UI build ──────────────────────────────────────────────────────────────────
-# This is the SAME console the hosted product runs. Surfaces with no self-hosted backend
-# (billing, marketplace, analytics, sign-in) are hidden by the edition flag rather than removed,
-# so the two stay one codebase. See ui/src/lib/edition.ts.
-FROM node:22-slim AS ui
-WORKDIR /ui
-# git: the UI depends on the ReifyUI component library straight from its repository.
-RUN apt-get update -y && apt-get install -y --no-install-recommends git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-# .npmrc matters at THIS layer: it carries legacy-peer-deps, without which npm refuses the
-# tree (several deps still declare React 18 peers while the app runs 19).
-COPY ui/package.json ui/package-lock.json* ui/.npmrc ./
-RUN npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
-COPY ui/ ./
-# Inlined into the client bundle at build time, so a self-hosted image can never present a
-# hosted-only surface no matter how it is run.
-ENV NEXT_TELEMETRY_DISABLED=1 \
-    NEXT_PUBLIC_HR_EDITION=selfhost
-RUN npm run build
 
 # ── runtime ───────────────────────────────────────────────────────────────────
 FROM python:3.12-slim
@@ -62,9 +42,11 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 
 # Document preview. The built-in skills create .docx/.pptx/.xlsx routinely, and LibreOffice is
 # also how those become a PDF — the officecli skill's own PDF export needs a plugin that is not
-# installed. A presentation you can only download is a worse answer than one you can look at. Browsers render none of them, so the console asks the gateway for a PDF rendition and
-# LibreOffice headless is what makes it. Impress/Writer/Calc only, no recommends: the full
-# libreoffice metapackage drags in Java and a desktop stack for no benefit here.
+# installed. A presentation you can only download is a worse answer than one you can look at.
+# Browsers render none of them, so the gateway's own document-preview endpoint converts to PDF
+# on request, and LibreOffice headless is what makes it. Impress/Writer/Calc only, no
+# recommends: the full libreoffice metapackage drags in Java and a desktop stack for no benefit
+# here.
 ARG WITH_DOC_PREVIEW=1
 RUN set -eux; \
     if [ "$WITH_DOC_PREVIEW" = "1" ]; then \
@@ -84,9 +66,9 @@ RUN set -eux; \
       && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Node is needed for the UI server and for the npm-based agent CLIs. 22, not 20: pi's
-# engine floor is >=22.19, and node 20 has been end-of-life since April 2026 anyway —
-# the other CLIs (claude >=18, codex >=20) run unchanged on 22.
+# Node is needed for the npm-based agent CLIs. 22, not 20: pi's engine floor is >=22.19, and
+# node 20 has been end-of-life since April 2026 anyway — the other CLIs (claude >=18,
+# codex >=20) run unchanged on 22.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* /root/.npm
@@ -157,15 +139,10 @@ COPY runner/  /app/runner/
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Next.js standalone output: server + only the modules it actually needs.
-COPY --from=ui /ui/.next/standalone /app/ui/
-COPY --from=ui /ui/.next/static     /app/ui/.next/static
-COPY --from=ui /ui/public           /app/ui/public
-
-# `agent` is the PRODUCT's user: the gateway and the console run as it and it owns the data
-# volume. The container itself starts as root and the entrypoint drops privileges per process,
-# because the runner needs root for one thing: every agent CLI runs as its own per-session uid,
-# which owns its session directory and nothing else (the write-wall; see docker/entrypoint.sh).
+# `agent` is the PRODUCT's user: the gateway runs as it and it owns the data volume. The
+# container itself starts as root and the entrypoint drops privileges per process, because the
+# runner needs root for one thing: every agent CLI runs as its own per-session uid, which owns
+# its session directory and nothing else (the write-wall; see docker/entrypoint.sh).
 # The CLIs refuse to run as root anyway (they gate their own permission bypass on it), and they
 # never do.
 #
@@ -186,11 +163,11 @@ RUN useradd -m -u 10001 agent \
     && chown -R agent:agent /data /app /home/agent \
     && chmod -R a+rX /opt/harnessrouter/skills /opt/harnessrouter/kits
 
-EXPOSE 3000
+EXPOSE 8080
 VOLUME ["/data"]
 
-# The UI is the only published port. The gateway and runner stay on loopback — nothing else
-# needs to be reachable from outside the container.
+# The gateway is the only published port — headless, no UI in front of it. The runner stays on
+# loopback inside the container; nothing outside needs to reach it directly.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s \
   CMD curl -fsS http://127.0.0.1:8080/healthz >/dev/null || exit 1
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Start the three processes and keep them honest.
+# Start the two processes and keep them honest.
 #
-# If any one of them dies the container exits, rather than limping along serving a UI whose
-# backend is gone — a half-dead container that still passes a TCP check is worse than one
-# that restarts. `docker run --restart` then does the recovering.
+# If either one dies the container exits, rather than limping along answering for a backend
+# that's gone — a half-dead container that still passes a TCP check is worse than one that
+# restarts. `docker run --restart` then does the recovering.
 set -euo pipefail
 
 # ── privilege layout ──────────────────────────────────────────────────────────
@@ -11,8 +11,8 @@ set -euo pipefail
 #   root    this entrypoint and the runner. The runner switches to a per-session uid for every
 #           agent process, which is the one thing that needs root. CAP_SETUID, CAP_SETGID and
 #           CAP_CHOWN are in Docker's default set: no --privileged, no --cap-add.
-#   agent   the product: the gateway, the console, the data volume. Its databases, blobs and
-#           secret store are readable by it alone.
+#   agent   the product: the gateway, the data volume. Its databases, blobs and secret store
+#           are readable by it alone.
 #   20000+  one uid per session, owning its session directory and nothing else. It cannot read or
 #           write another session's workspace, the workspace parent, the databases, the blobs or
 #           the secret store: a deliverable written to any of those paths fails at the write, while
@@ -74,7 +74,8 @@ PY=/usr/local/bin/python3
 export HR_BACKING="${HR_BACKING:-local}"
 export HR_DATA_DIR="$DATA_DIR"
 
-# No auth: single-tenant box, identity is a constant supplied by the UI.
+# No auth: single-tenant box, identity is a fixed constant rather than something a login
+# selects.
 export HR_IDENTITY_MODE="${HR_IDENTITY_MODE:-off}"
 
 # No billing or metering: these are hosted concerns and no-op when their URLs are unset.
@@ -99,67 +100,10 @@ if [ -z "${HARNESS_INTERNAL_KEY:-}" ]; then
   export HARNESS_INTERNAL_KEY="$("$PY" -c 'import secrets; print(secrets.token_hex(32))')"
 fi
 
-# The console reaches the gateway over loopback; it is the only process that can, since only
-# the console's port is published.
-export HARNESS_GATEWAY_URL="${HARNESS_GATEWAY_URL:-http://127.0.0.1:8080}"
-export NEXT_PUBLIC_HR_EDITION=selfhost
-
-# ── console login ─────────────────────────────────────────────────────────────
-# The console can create harnesses, read every transcript, and run an agent with your provider
-# key, so an instance anyone can reach needs a gate. Defaults exist so the first run works; they
-# are also published in the README, which makes them a placeholder rather than a secret.
-export HR_AUTH_USER="${HR_AUTH_USER:-harnessrouter}"
-export HR_AUTH_PASSWORD="${HR_AUTH_PASSWORD:-harnessrouter}"
-export HR_AUTH_STORE="${HR_AUTH_STORE:-/data/selfhost-auth.json}"
-
-# Credentials changed from the profile page live in HR_AUTH_STORE and win over the environment:
-# an env var set at `docker run` months ago must not silently undo a password change. The console
-# signs its session cookie with HR_SESSION_KEY, which is derived from whichever source wins —
-# so the key changes when the credentials do, and every existing session stops verifying.
-#
-# It is derived HERE, at boot, because the gate runs in Next.js middleware on the Edge runtime:
-# no filesystem, and no visibility into environment changes made after start-up. That is why
-# changing credentials restarts the console (below) instead of taking effect in place.
-hr_session_key() {
-  if [ -f "$HR_AUTH_STORE" ]; then
-    "$PY" - "$HR_AUTH_STORE" <<'PYEOF' 2>/dev/null && return 0
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    if d.get("user") and d.get("hash"):
-        print("%s:%s" % (d["user"], d["hash"]))
-    else:
-        raise ValueError
-except Exception:
-    raise SystemExit(1)
-PYEOF
-  fi
-  printf '%s:%s\n' "$HR_AUTH_USER" "$HR_AUTH_PASSWORD"
-}
-
-hr_stored_user() {
-  [ -f "$HR_AUTH_STORE" ] || { printf '%s\n' "$HR_AUTH_USER"; return 0; }
-  "$PY" -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["user"])' "$HR_AUTH_STORE" 2>/dev/null \
-    || printf '%s\n' "$HR_AUTH_USER"
-}
-
-if [ "${HR_AUTH_DISABLED:-}" = "1" ]; then
-  echo "[harnessrouter] WARNING: login is DISABLED (HR_AUTH_DISABLED=1) — anyone who can reach this port has full control"
-elif [ -f "$HR_AUTH_STORE" ]; then
-  echo "[harnessrouter] sign in as '$(hr_stored_user)' (credentials set from the profile page)"
-elif [ "$HR_AUTH_PASSWORD" = "harnessrouter" ]; then
-  echo "[harnessrouter] WARNING: using the DEFAULT password. Set HR_AUTH_PASSWORD, or change it from the profile page, before exposing this instance."
-fi
-export PORT="${PORT:-3000}"
-# Next binds to $HOSTNAME, and Docker sets that to the container id, which resolves to ONE of the
-# container's addresses. That is fine with a single network and silently fatal with two: connect
-# this container to a user-defined network — which is exactly what the README tells you to do to
-# reach a database — and after the next restart Next comes up on that network's address while the
-# published port still forwards to the bridge one. Nothing is listening where the port lands, so
-# the console answers 502 while the container reports healthy and the log says "Ready".
-# Measured on the test box 2026-08-16: LISTEN 172.18.0.5:3000, published 127.0.0.1:3000 -> the
-# bridge ip. Binding every interface is the only answer that survives a second network.
-export HOSTNAME=0.0.0.0
+# The gateway itself is unauthenticated — headless, no console gate in front of it. Whatever
+# publishes its port is what controls who can reach it (see README: publish to 127.0.0.1 only,
+# or put a proxy with its own auth in front, never publish to an open interface unguarded).
+export PORT="${PORT:-8080}"
 
 # ── agent CLIs: installed here, not shipped in the image ──────────────────────
 # Claude Code is distributed under Anthropic's own terms and hermes-agent declares no license,
@@ -167,8 +111,8 @@ export HOSTNAME=0.0.0.0
 # operator installs them under those terms, and the image stays redistributable.
 #
 # They go in the data volume, so this is once per volume rather than once per start. A failure
-# to install one backend is not fatal: the others still work, and the gateway's catalog is what
-# the UI offers, so an unavailable backend simply isn't listed.
+# to install one backend is not fatal: the others still work, and the gateway's own catalog
+# endpoint is what a caller sees, so an unavailable backend simply isn't listed.
 TOOLS="$DATA_DIR/agent-tools"
 export PATH="$TOOLS/bin:$PATH"
 export NODE_PATH="$TOOLS/lib/node_modules"
@@ -177,7 +121,7 @@ export HR_BACKENDS="${HR_BACKENDS:-claude,codex,hermes,pi,dsh}"
 wanted()   { [[ ",$HR_BACKENDS," == *",$1,"* ]]; }
 # The executable IS the definition of "installed" — an installer that exits 0 without producing
 # one is still a failed install, and reporting it as success is how a backend silently vanishes
-# from the console with no explanation.
+# with no explanation.
 backend_bin() {
   case "$1" in
     claude) echo "$TOOLS/bin/claude" ;;
@@ -311,54 +255,25 @@ if [ -n "$missing" ]; then
   echo "[harnessrouter] WARN: requested but not installed:$missing — those backends cannot run"
 fi
 
-# runner (loopback only). Root, for the per-session uid switch; HR_SESSION_UIDS=1 is the
-# declaration the runner fails closed without. The console's credentials and the secret-store key
-# are the product's and are not in its environment at all.
-( cd /app/runner && exec env -u HR_AUTH_USER -u HR_AUTH_PASSWORD -u HR_AUTH_STORE -u HR_SECRET_KEY \
+# runner (loopback only, container-internal). Root, for the per-session uid switch;
+# HR_SESSION_UIDS=1 is the declaration the runner fails closed without. The secret-store key is
+# the product's and is not in its environment at all.
+( cd /app/runner && exec env -u HR_SECRET_KEY \
     HR_SESSION_UIDS=1 "$PY" -m uvicorn server:app --host 127.0.0.1 --port 8081 --log-level warning ) &
 pids+=($!)
 
-# gateway (loopback only), as the product. umask 077: what it creates on the volume (databases,
-# blobs, the secret store) is its alone.
-( cd /app/gateway && exec $AS_PRODUCT sh -c 'umask 077; exec "$0" -m uvicorn app:app --host 127.0.0.1 --port 8080 --log-level warning' "$PY" ) &
+# gateway, as the product. umask 077: what it creates on the volume (databases, blobs, the
+# secret store) is its alone. Bound to every interface, not just loopback, since this is now the
+# published port — headless, no console gate in front of it — so whoever publishes it (docker
+# run -p, a proxy) is what controls who can reach it; see README.
+( cd /app/gateway && exec $AS_PRODUCT sh -c 'umask 077; exec "$0" -m uvicorn app:app --host 0.0.0.0 --port 8080 --log-level warning' "$PY" ) &
 pids+=($!)
 
-# Wait for the gateway before the UI starts serving, so a first page load never races a
-# backend that is still binding.
+# Wait for the gateway before declaring ready, so "ready" never races a backend still binding.
 for _ in $(seq 1 60); do
   curl -fsS "http://127.0.0.1:8080/healthz" >/dev/null 2>&1 && break
   sleep 1
 done
-
-# UI (the only published port).
-#
-# Supervised, unlike the other two: changing the console password has to take effect in the
-# middleware, which only reads its signing key at boot — so the profile route writes the new
-# credentials and exits, and this loop brings the console back with them about a second later.
-# The gateway and runner are untouched, so a task mid-turn keeps running through the blip.
-#
-# A crash-loop is not silent: the console is the only published port, so a UI that cannot start
-# is immediately visible, and the message below says how many times it has restarted.
-(
-  cd /app/ui
-  restarts=0
-  while :; do
-    HR_SESSION_KEY="$(hr_session_key)" \
-    HR_AUTH_USER="$(hr_stored_user)" \
-      $AS_PRODUCT sh -c 'umask 077; exec node server.js'
-    status=$?
-    # A clean exit is the credential change asking for a restart. Anything else is a real
-    # failure, and repeating it forever would hide it — so give up and let the container die.
-    if [ "$status" -ne 0 ]; then
-      echo "[harnessrouter] console exited with status $status — not restarting"
-      exit "$status"
-    fi
-    restarts=$((restarts + 1))
-    echo "[harnessrouter] console restarting to pick up new credentials (restart #$restarts)"
-    sleep 1
-  done
-) &
-pids+=($!)
 
 echo "[harnessrouter] ready on :$PORT"
 
